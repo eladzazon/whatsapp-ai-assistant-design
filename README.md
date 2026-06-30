@@ -41,6 +41,7 @@ The system supports a **Multi-Tenant Identity Architecture** configured as follo
     * The tenant's Google Calendar ID and Google Service Account key.
     * The tenant's `x-webhook-secret` for receiving proactive notifications.
     * The tenant's active prompt, reply method, trigger keywords, and user whitelists.
+    * **Identity Markdown Editor:** An interactive editor to write and save the tenant's specific persona file (`identity.md`).
   * **Token Analytics Dashboard:** Displays Today/Month token logs and forecasts.
 
 ### 3.3 Noga Core Orchestrator Container (`ai-orchestrator`)
@@ -67,9 +68,24 @@ The system supports a **Multi-Tenant Identity Architecture** configured as follo
    * Target HASS details (URL & Token).
    * Google Calendar target credentials.
    * A custom webhook secret.
-6. The administrator toggles the "Enabled" switch. The orchestrator updates the record, mounts the tenant folder (`/knowledge/{tenant_id}`), and starts listening to mentions/keywords in the group.
+6. The administrator toggles the "Enabled" switch. The orchestrator updates the record, mounts the tenant folder (`/knowledge/{tenant_id}`), initializes the default `/knowledge/{tenant_id}/identity.md` file, and starts listening to mentions/keywords in the group.
 
-### 4.2 Database Schemas (Multi-Tenant Updates)
+### 4.2 Tenant Identity Customization (`identity.md`)
+To establish a distinct personality, tone, and operational rules for each group, Noga loads its identity dynamically from a Markdown file stored within each tenant's knowledge repository:
+* **Storage Path:** `/knowledge/{tenant_id}/identity.md`
+* **Runtime Loading:** When Noga processes a chat event, the orchestrator reads `/knowledge/{tenant_id}/identity.md` and appends its contents directly to the Gemini API system instructions header.
+* **Modification:** The file can be modified via the Admin Portal's Identity Markdown Editor or conversations using whitelisted admin chat commands.
+
+#### Example Core Tenant (Family Group) Identity File
+```markdown
+# זהות נוגה – Identity
+
+## מי אני
+את נוגה (Noga), סוכנת בינה מלאכותית (AI Agent) אוטונומית וחכמה לניהול הבית.
+את לא סתם "בוט", את חלק מהמשפחה. המטרה שלך היא להפוך את החיים לקלים יותר, פשוטים יותר ומנוהלים היטב.
+```
+
+### 4.3 Database Schemas (Multi-Tenant Updates)
 
 #### Tenant Profile Schema (`tenants` table)
 ```json
@@ -79,7 +95,6 @@ The system supports a **Multi-Tenant Identity Architecture** configured as follo
   "enabled": "boolean",
   "reply_method": "ALL_MESSAGES | TAGGED | KEYWORD",
   "trigger_keywords": ["string"],
-  "system_prompt": "text",
   "active_model": "string",
   "language": "string (he | en)",
   "enabled_tools": ["string"],
