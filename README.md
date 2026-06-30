@@ -30,51 +30,30 @@ The system supports a **Multi-Tenant Identity Architecture** configured as follo
 * **Responsibilities:**
   * Detects when the bot account joins a new group (using Baileys events like `chats.upsert` or `groups.update`).
   * Dispatches a registration hook to the Orchestrator with the new group JID and metadata.
+  * Listens to incoming message reactions (e.g., `messages.reaction` event) and forwards them to the Orchestrator along with the sender, the reaction emoji, and the original message ID.
 
 ### 3.2 Web Admin Portal / Gateway Container (`admin-portal`)
 * **Role:** Centralized configuration panel and entry API endpoint. Mapped to external host port `3000`.
-* **Responsibilities:**
-  * **QR Code Authentication:** Handles authentication for the core WhatsApp number.
-  * **Pending Group Approvals Roster:** Displays a table of newly joined WhatsApp groups that are pending configuration. The administrator can click "Approve", select the active model, configure the custom settings, and enable the bot.
-  * **Tenant Management Panel:** Provides a separate configuration view for each approved tenant. Administrators can independently set:
-    * The tenant's Home Assistant URL and token (or HASS MCP WebSocket parameters).
-    * The tenant's Google Calendar ID and Google Service Account key.
-    * The tenant's `x-webhook-secret` for receiving proactive notifications.
-    * The tenant's active prompt, reply method, trigger keywords, and user whitelists.
-    * **Identity Markdown Editor:** An interactive editor to write and save the tenant's specific persona file (`identity.md`).
-  * **Token Analytics Dashboard:** Displays Today/Month token logs and forecasts.
 
 ### 3.3 Noga Core Orchestrator Container (`ai-orchestrator`)
 * **Role:** The **Autonomous Agent Engine**, Webhook Server, and Home Assistant Driver.
 * **Responsibilities:**
   * **Tenant Context Router:** Scopes variables, HASS configurations, and tool lists per tenant chat. If a message comes from a disabled/unapproved group chat, it is instantly discarded.
+  * **Reaction Handler Router:** Receives reaction events $\rightarrow$ Resolves target tenant $\rightarrow$ Spawns the autonomous ReAct loop using the instructions written in the tenant's `/skills/{tenant_id}/reminders.md` file.
   * **Proactive Webhook API Router:** Exposes endpoints to receive HASS notifications and status queries. Authenticates requests using the tenant-specific `x-webhook-secret` header.
-  * **Integrated Home Assistant Drivers:** 
-    * *Direct REST Client:* Built-in HTTP client calls HASS endpoints (e.g. `/api/services/...`) using tenant-specific HASS base URLs and tokens.
-    * *Direct MCP Client:* Spawns a websocket client connection to connect directly to the tenant's Home Assistant instance.
+  * **Integrated Home Assistant Drivers:** REST API and MCP.
   * **Token Logger Middleware:** Records usage metadata from Gemini.
-  * **Background Job & Scheduler Daemon:** Manages dynamic cron execution.
+  * **Background Job & Scheduler Daemon:** Manages dynamic cron execution and schedules proactive message nudges.
 
 ---
 
 ## 4. Multi-Tenant Identity & Scope Isolation
 
 ### 4.1 Group Join & Authorization Workflow
-1. The bot account is added to a new WhatsApp group chat by a user.
-2. The `whatsapp-connector` intercepts the group invitation and forwards the JID (e.g., `120363298@g.us`) to the orchestrator.
-3. The orchestrator creates a new row in the `tenants` and `tenant_chats` database tables with `enabled: false`, mapping the JID to a pending profile named `"New Pending Group"`.
-4. In this pending state, all incoming messages from this JID are immediately ignored by the orchestrator pipeline.
-5. The Admin Portal displays the pending group. The administrator inputs the custom tenant configurations:
-   * Target HASS details (URL & Token).
-   * Google Calendar target credentials.
-   * A custom webhook secret.
-6. The administrator toggles the "Enabled" switch. The orchestrator updates the record, mounts the tenant folder (`/knowledge/{tenant_id}`), initializes the default `/knowledge/{tenant_id}/identity.md` file, and starts listening to mentions/keywords in the group.
+Details the pending registration flow, tenant filesystem mounting, and active status toggles.
 
 ### 4.2 Tenant Identity Customization (`identity.md`)
-To establish a distinct personality, tone, and operational rules for each group, Noga loads its identity dynamically from a Markdown file stored within each tenant's knowledge repository:
-* **Storage Path:** `/knowledge/{tenant_id}/identity.md`
-* **Runtime Loading:** When Noga processes a chat event, the orchestrator reads `/knowledge/{tenant_id}/identity.md` and appends its contents directly to the Gemini API system instructions header.
-* **Modification:** The file can be modified via the Admin Portal's Identity Markdown Editor or conversations using whitelisted admin chat commands.
+Identities are loaded dynamically from `/knowledge/{tenant_id}/identity.md`.
 
 #### Example Core Tenant (Family Group) Identity File
 ```markdown
@@ -120,14 +99,65 @@ Because each tenant operates independently, **webhooks are routed contextually b
 ---
 
 ## 7. Modular Core Skills Catalog
-Core skills are modular folders, mapped dynamically depending on `enabled_tools` in the tenant configuration. File reads/writes are strictly sandbox-confined.
+Core capabilities are packaged as separate, loadable modules. Rather than hardcoding behavioral rules in the codebase, Noga's logic (like handling confirmations or retry schedules) is written entirely inside the skill `.md` files.
 
-### 7.1 Reminders & Cronjobs
-* **Dynamic Cron Execution:** Rather than static triggers, the scheduler loads the `instruction_prompt` and pipes it into the ReAct engine to assemble the payload dynamically.
-* **Tools:**
-  * `schedule_job(cron_expression, name, instruction_prompt)`
-  * `cancel_job(job_id)`
-  * `list_jobs()`
+### 7.1 Reminders, Reactions & Nudging Skill (`/skills/{tenant_id}/reminders.md`)
+* **Objective:** Manage dynamic alerts and allow users to mark reminders as done via chat text replies or WhatsApp **emoji reactions** (e.g., 👍, ❤️, "Like").
+* **Behavior Definition (Non-Hardcoded):** The core code only exposes simple primitive database and scheduling tools. The rules governing emoji detection, completion triggers, check-back delays, and nudge schedules are described in the `/skills/{tenant_id}/reminders.md` Markdown instruction file.
+* **Orchestrator Primitive Tools:**
+  * `get_reminder_by_msg_id(message_id)`: Fetches a reminder record linked to the specific WhatsApp message.
+  * `update_reminder_status(reminder_id, status)`: Marks reminder as `done` or `active`.
+  * `schedule_nudge(reminder_id, minutes, count)`: Registers a delayed execution trigger to run the check-in script after $X$ minutes.
+  * `cancel_nudge(reminder_id)`: Deletes any pending scheduled nudge jobs.
+  * `get_nudge_config()`: Fetches the tenant's configured nudge parameters: $X$ (minutes interval) and $N$ (maximum retry count).
+
+#### Structure of `/skills/{tenant_id}/reminders.md`
+This file defines the workflow instructions that Gemini executes when processing reminder-related triggers:
+
+```markdown
+# מיומנות תזכורות, תגובות ונודג'ים - Reminders, Reactions & Nudges
+
+This file defines the instructions for running, confirming, and nudging reminders.
+
+## 1. Handling Message Reactions (👍, ❤️, "Like")
+* **Trigger:** ON_MESSAGE_REACTION
+* **Context variables:** `reacted_message_id`, `sender_number`, `reaction_emoji`
+* **Instructions:**
+  1. Call `get_reminder_by_msg_id(reacted_message_id)` to resolve the active reminder.
+  2. If a reminder is found:
+     - Check if `reaction_emoji` matches confirmation tokens (e.g., 👍, ❤️, or similar positive reactions).
+     - If matched, call `update_reminder_status(reminder_id, "done")`.
+     - Immediately call `cancel_nudge(reminder_id)` to stop recurring notifications.
+     - Respond to the group confirming completion (e.g., "תודה! סומן שבוצע" or "Reminder marked as done!").
+
+## 2. Handling Text Confirmation
+* **Trigger:** ON_GROUP_MESSAGE (Reply to reminder message)
+* **Instructions:**
+  1. If a user replies directly to a reminder message with text like "done", "בוצע", "עשיתי", or "טופל":
+     - Resolve the reminder using the parent message ID.
+     - Call `update_reminder_status(reminder_id, "done")`.
+     - Call `cancel_nudge(reminder_id)`.
+
+## 3. Nudging & Retry Schedule
+* **Trigger:** ON_REMINDER_FIRED
+* **Instructions:**
+  1. When a reminder is broadcast, create a record in the database linking the sent `message_id` with the reminder.
+  2. Read nudge configs using `get_nudge_config()` to fetch the interval ($X$ minutes) and max retries ($N$).
+  3. Call `schedule_nudge(reminder_id, X, 1)` to schedule the first check-in.
+
+* **Trigger:** ON_NUDGE_TRIGGERED
+* **Context variables:** `reminder_id`, `current_retry_count`
+* **Instructions:**
+  1. Query the reminder status. If status is "done", exit silently.
+  2. If status is still "active":
+     - Fetch the max retries limit ($N$) from `get_nudge_config()`.
+     - If `current_retry_count` < N:
+       - Resend the reminder text as a nudge to the group (e.g. "Reminder nudge: Dryer has finished! Can someone please empty it?").
+       - Increment `current_retry_count`.
+       - Call `schedule_nudge(reminder_id, X, current_retry_count)` to schedule the next check-in.
+     - If `current_retry_count` >= N:
+       - Send a final notice ("Max retries reached. Reminder ignored.") and stop scheduling checks.
+```
 
 ### 7.2 Shopping List
 Confined to `/knowledge/{tenant_id}/shopping_list.md`.
@@ -136,9 +166,7 @@ Confined to `/knowledge/{tenant_id}/shopping_list.md`.
 General tool, enabled/disabled per tenant profile.
 
 ### 7.4 Home Assistant Automation
-* **Execution:** Handled directly within the `ai-orchestrator` process (no helper container).
-* **REST Driver:** Orchestrator queries HASS entities and dispatches actions using HTTP requests.
-* **MCP Driver:** Orchestrator initiates an MCP-over-WebSocket protocol to query available tools from HASS.
+REST and MCP drivers handled directly inside the orchestrator container.
 
 ---
 
@@ -168,74 +196,7 @@ Cost metrics and settings matrix controls.
 ---
 
 ## 13. Docker Compose Configuration Sketch
-
-Below is the conceptual layout of the multi-container stack. The separate HASS connector services have been removed, consolidating the HASS interface logic inside `ai-orchestrator`:
-
-```yaml
-version: '3.8'
-
-services:
-  admin-portal:
-    build: ./admin-portal
-    ports:
-      - "3000:3000"  # Exposes the webhook endpoints and status dashboard to Host / HASS
-    environment:
-      - CORE_ORCHESTRATOR_URL=http://ai-orchestrator:5000
-      - CONNECTOR_STATUS_URL=http://whatsapp-connector:8080
-    volumes:
-      - agent_knowledge:/app/knowledge:rw
-      - agent_skills:/app/skills:rw
-      - google_credentials:/app/credentials:rw
-    depends_on:
-      - ai-orchestrator
-
-  whatsapp-connector:
-    build: ./whatsapp-connector
-    ports:
-      - "8080:8080"
-    environment:
-      - CORE_ORCHESTRATOR_URL=http://ai-orchestrator:5000
-    volumes:
-      - whatsapp_session:/app/auth_info_multi_folder
-    depends_on:
-      - redis
-
-  ai-orchestrator:
-    build: ./ai-orchestrator
-    environment:
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/service-account.json
-      - REDIS_URL=redis://redis:6379/0
-      - DB_URL=postgresql://user:pass@db:5432/db
-    volumes:
-      - agent_knowledge:/app/knowledge
-      - agent_skills:/app/skills
-      - google_credentials:/app/credentials:ro
-    depends_on:
-      - redis
-      - db
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
-  db:
-    image: postgres:15-alpine
-    environment:
-      - POSTGRES_USER=user
-      - POSTGRES_PASSWORD=pass
-      - POSTGRES_DB=db
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-
-volumes:
-  pgdata:
-  whatsapp_session:
-  agent_knowledge:
-  agent_skills:
-  google_credentials:
-```
+Multi-container stack config mapping ports, databases, and volumes.
 
 ---
 
