@@ -39,15 +39,29 @@ The system supports a **Multi-Tenant Identity Architecture** configured as follo
   * Listens to incoming message reactions (e.g., `messages.reaction` event) and forwards them to the Orchestrator.
 
 ### 3.2 Web Admin Portal / Gateway Container (`admin-portal`)
-* **Role:** Centralized configuration panel.
+* **Role:** Centralized configuration panel and entry API endpoint. Mapped to external host port `3000`.
+* **Responsibilities:**
+  * **QR Code Authentication:** Handles authentication for the core WhatsApp number.
+  * **Pending Group Approvals Roster:** Displays a table of newly joined WhatsApp groups that are pending configuration. The administrator can click "Approve", select the active model, configure the custom settings, and enable the bot.
+  * **Tenant Management Panel:** Provides a separate configuration view for each approved tenant. Administrators can independently set:
+    * The tenant's Home Assistant URL and token (or HASS MCP WebSocket parameters).
+    * The tenant's Google Calendar ID and Google Service Account key.
+    * The tenant's `x-webhook-secret` for receiving proactive notifications.
+    * The tenant's active prompt, reply method, trigger keywords, and user whitelists.
+  * **Interactive Markdown Editor (Knowledge & Skills Manager):** Exposes an easy-to-use, browser-based text editor (with split-screen markdown preview and syntax highlighting) allowing the administrator to:
+    * Browse the `/knowledge/{tenant_id}/` and `/skills/{tenant_id}/` directory trees.
+    * Open and edit any `.md` file directly in the browser (e.g., modify `identity.md`, add rules in `reminders.md`, or manually check/edit `shopping_list.md` and `inventory.md` tables).
+    * Create new `.md` files dynamically to add new skills or knowledge items.
+    * Delete files that are no longer needed.
+  * **Token Analytics Dashboard:** Displays Today/Month token logs and forecasts.
 
 ### 3.3 Noga Core Orchestrator Container (`ai-orchestrator`)
 * **Role:** The **Autonomous Agent Engine**, Webhook Server, and Home Assistant Driver.
 * **Responsibilities:**
-  * **Generic ReAct Engine:** Runs a strict Thought $\rightarrow$ Action $\rightarrow$ Observation loop. It compiles the system instructions by loading `/knowledge/{tenant_id}/identity.md` and appending active skill files from `/skills/{tenant_id}/*.md`.
+  * **Generic ReAct Engine:** Runs a Thought $\rightarrow$ Action $\rightarrow$ Observation loop.
   * **Tenant Context Router:** Scopes variables, HASS configurations, and tool lists per tenant chat.
-  * **Event Dispatcher:** Map inputs (WhatsApp message, Webhook call, emoji reaction, cron triggers) to the runtime context.
-  * **Tool Primitive Broker:** Exposes simple, parameter-validated CRUD and connection primitives (listed in Section 7) to the agent loop, avoiding any hardcoded business logic.
+  * **Event Dispatcher:** Maps incoming requests to the execution context.
+  * **Tool Primitive Broker:** Exposes simple, parameter-validated CRUD and connection primitives.
   * **Proactive Webhook API Router:** Exposes endpoints to receive HASS notifications and status queries.
   * **Token Logger Middleware:** Records usage metadata from Gemini.
   * **Background Job & Scheduler Daemon:** Manages dynamic cron execution.
@@ -87,7 +101,7 @@ Noga exposes REST endpoints on port `3000` to allow Home Assistant to broadcast 
 ---
 
 ## 7. Modular Core Skills Catalog
-Core capabilities are packaged as separate, loadable modules. Rather than hardcoding behavioral rules in the codebase, Noga's logic (like handling confirmations or retry schedules) is written entirely inside the skill `.md` files.
+Core capabilities are packaged as separate, loadable modules. Rather than hardcoding behavioral rules in the codebase, Noga's logic is written entirely inside the skill `.md` files.
 
 The `ai-orchestrator` process only exposes generic, low-level **Tool Primitives**. The AI agent parses the Markdown skill files at runtime to determine how to leverage these tools.
 
@@ -207,7 +221,73 @@ Cost metrics and settings matrix controls.
 ---
 
 ## 13. Docker Compose Configuration Sketch
-Multi-container stack config mapping ports, databases, and volumes.
+Below is the conceptual layout of the multi-container stack:
+
+```yaml
+version: '3.8'
+
+services:
+  admin-portal:
+    build: ./admin-portal
+    ports:
+      - "3000:3000"  # Exposes the webhook endpoints and status dashboard to Host / HASS
+    environment:
+      - CORE_ORCHESTRATOR_URL=http://ai-orchestrator:5000
+      - CONNECTOR_STATUS_URL=http://whatsapp-connector:8080
+    volumes:
+      - agent_knowledge:/app/knowledge:rw
+      - agent_skills:/app/skills:rw
+      - google_credentials:/app/credentials:rw
+    depends_on:
+      - ai-orchestrator
+
+  whatsapp-connector:
+    build: ./whatsapp-connector
+    ports:
+      - "8080:8080"
+    environment:
+      - CORE_ORCHESTRATOR_URL=http://ai-orchestrator:5000
+    volumes:
+      - whatsapp_session:/app/auth_info_multi_folder
+    depends_on:
+      - redis
+
+  ai-orchestrator:
+    build: ./ai-orchestrator
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/service-account.json
+      - REDIS_URL=redis://redis:6379/0
+      - DB_URL=postgresql://user:pass@db:5432/db
+    volumes:
+      - agent_knowledge:/app/knowledge
+      - agent_skills:/app/skills
+      - google_credentials:/app/credentials:ro
+    depends_on:
+      - redis
+      - db
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+      - POSTGRES_DB=db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
+  whatsapp_session:
+  agent_knowledge:
+  agent_skills:
+  google_credentials:
+```
 
 ---
 
