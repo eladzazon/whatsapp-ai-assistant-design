@@ -15,48 +15,11 @@ To keep the deployment stack simple and consolidated, **Home Assistant communica
 
 The system consists of the admin portal, the WhatsApp Baileys gateway, and the core orchestrator. All external communication (Gemini, Google, and Home Assistant) goes directly through the orchestrator.
 
-```mermaid
-graph TD
-    %% WhatsApp Entry points
-    User_Home[Family Group Chat] <--> |Msg / Chat ID: Home_Group| WA_Client[Headless WhatsApp Client / Baileys]
-    User_Work[Work Group Chat] <--> |Msg / Chat ID: Work_Group| WA_Client
-
-    subgraph Docker Bridge Network
-        %% Gateway (Port 3000 mapped to Host)
-        WA_Client <--> |Incoming Messages + Chat ID| WA_Conn[WhatsApp Connector Service]
-        
-        %% Orchestrator & Tenant Router
-        WA_Conn <--> |Deliver Message| Core_Orc[Noga Core Orchestrator]
-        
-        %% Database lookup
-        Core_Orc <--> |Resolve Chat ID to Tenant Profile| DB[(Redis / PostgreSQL)]
-        
-        %% Job Scheduler
-        Cron_Scheduler[Background Job Scheduler] --> |Trigger Job| Core_Orc
-        
-        %% Context Sandbox
-        subgraph Tenant Context Sandboxing
-            Core_Orc --> |Load Persona & Directory| Tenant_Home[Tenant: Home Context]
-            Core_Orc --> |Load Persona & Directory| Tenant_Work[Tenant: Work Context]
-        end
-
-        %% Isolated Storage
-        Tenant_Home <--> |Read/Write| Vol_KB_Home[(/knowledge/tenant_home)]
-    end
-
-    subgraph Home Network
-        %% Proactive Webhooks & Status Check
-        HA_Core[Home Assistant Core] --> |POST /api/notify / x-webhook-secret| Core_Orc
-        HA_Core --> |POST /api/webhook/reminder| Core_Orc
-        HA_Core <--> |GET /api/webhook/status| Core_Orc
-        
-        %% Direct Pull / Control from Orchestrator (No intermediate containers)
-        Core_Orc <--> |REST API or MCP over WebSocket| HA_Core
-    end
-
-    Admin_User[Core Admin Browser] <--> |Auth QR Code & Create Tenants| Admin_Portal[Web Admin Portal]
-    Admin_Portal <--> |Read / Write Configs & Token Logs| DB
-```
+The system supports a **Multi-Tenant Identity Architecture** configured as follows:
+* **The Core/Family Tenant:** The primary default tenant representing the core family group chat.
+* **Independent Sub-Tenants:** Each WhatsApp group that Noga joins is treated as a separate, fully isolated tenant. 
+* **Complete Feature Isolation:** Each tenant has its own independent credentials and features. There is no shared configuration. A tenant configures its own Home Assistant API endpoints (`hass_url`, `hass_token`), Google Calendar credentials, webhook secrets, file volumes, and custom system prompt (identity persona) independently from the Admin Portal.
+* **Admin Approval Join Flow:** When Noga is added to any new WhatsApp group, the agent registers the group JID in the database but defaults to `enabled: false`. Noga will remain silent in the group until the primary administrator approves the group, configures its custom credentials, and toggles the membership status to **Enabled** from the Admin Portal.
 
 ---
 
@@ -64,18 +27,30 @@ graph TD
 
 ### 3.1 WhatsApp Connector Container (`whatsapp-connector`)
 * **Role:** Establishes the single core WhatsApp Web connection using Baileys.
+* **Responsibilities:**
+  * Detects when the bot account joins a new group (using Baileys events like `chats.upsert` or `groups.update`).
+  * Dispatches a registration hook to the Orchestrator with the new group JID and metadata.
 
 ### 3.2 Web Admin Portal / Gateway Container (`admin-portal`)
 * **Role:** Centralized configuration panel and entry API endpoint. Mapped to external host port `3000`.
+* **Responsibilities:**
+  * **QR Code Authentication:** Handles authentication for the core WhatsApp number.
+  * **Pending Group Approvals Roster:** Displays a table of newly joined WhatsApp groups that are pending configuration. The administrator can click "Approve", select the active model, configure the custom settings, and enable the bot.
+  * **Tenant Management Panel:** Provides a separate configuration view for each approved tenant. Administrators can independently set:
+    * The tenant's Home Assistant URL and token (or HASS MCP WebSocket parameters).
+    * The tenant's Google Calendar ID and Google Service Account key.
+    * The tenant's `x-webhook-secret` for receiving proactive notifications.
+    * The tenant's active prompt, reply method, trigger keywords, and user whitelists.
+  * **Token Analytics Dashboard:** Displays Today/Month token logs and forecasts.
 
 ### 3.3 Noga Core Orchestrator Container (`ai-orchestrator`)
 * **Role:** The **Autonomous Agent Engine**, Webhook Server, and Home Assistant Driver.
 * **Responsibilities:**
-  * **Tenant Context Router:** Scopes variables and tool lists per tenant chat.
-  * **Proactive Webhook API Router:** Exposes endpoints to receive HASS messages and status queries.
+  * **Tenant Context Router:** Scopes variables, HASS configurations, and tool lists per tenant chat. If a message comes from a disabled/unapproved group chat, it is instantly discarded.
+  * **Proactive Webhook API Router:** Exposes endpoints to receive HASS notifications and status queries. Authenticates requests using the tenant-specific `x-webhook-secret` header.
   * **Integrated Home Assistant Drivers:** 
-    * *Direct REST Client:* Built-in HTTP client calls HASS endpoints (e.g. `/api/services/...`) directly using HASS long-lived tokens configured in settings.
-    * *Direct MCP Client:* Spawns a websocket client connection to connect directly to the Home Assistant instance, fetching dynamic tool declarations.
+    * *Direct REST Client:* Built-in HTTP client calls HASS endpoints (e.g. `/api/services/...`) using tenant-specific HASS base URLs and tokens.
+    * *Direct MCP Client:* Spawns a websocket client connection to connect directly to the tenant's Home Assistant instance.
   * **Token Logger Middleware:** Records usage metadata from Gemini.
   * **Background Job & Scheduler Daemon:** Manages dynamic cron execution.
 
@@ -83,8 +58,16 @@ graph TD
 
 ## 4. Multi-Tenant Identity & Scope Isolation
 
-### 4.1 Tenant Context Resolution Lifecycle
-Messages resolve by `chat_id` to load configurations, schemas, and restrict active tool execution.
+### 4.1 Group Join & Authorization Workflow
+1. The bot account is added to a new WhatsApp group chat by a user.
+2. The `whatsapp-connector` intercepts the group invitation and forwards the JID (e.g., `120363298@g.us`) to the orchestrator.
+3. The orchestrator creates a new row in the `tenants` and `tenant_chats` database tables with `enabled: false`, mapping the JID to a pending profile named `"New Pending Group"`.
+4. In this pending state, all incoming messages from this JID are immediately ignored by the orchestrator pipeline.
+5. The Admin Portal displays the pending group. The administrator inputs the custom tenant configurations:
+   * Target HASS details (URL & Token).
+   * Google Calendar target credentials.
+   * A custom webhook secret.
+6. The administrator toggles the "Enabled" switch. The orchestrator updates the record, mounts the tenant folder (`/knowledge/{tenant_id}`), and starts listening to mentions/keywords in the group.
 
 ### 4.2 Database Schemas (Multi-Tenant Updates)
 
@@ -100,9 +83,10 @@ Messages resolve by `chat_id` to load configurations, schemas, and restrict acti
   "active_model": "string",
   "language": "string (he | en)",
   "enabled_tools": ["string"],
-  "webhook_secret": "string",
+  "webhook_secret": "string (Tenant-specific x-webhook-secret check)",
   "hass_url": "string (Tenant-specific HASS base URL)",
-  "hass_token": "string (Tenant-specific HASS long-lived token)"
+  "hass_token": "string (Tenant-specific HASS long-lived token)",
+  "google_calendar_id": "string (Tenant-specific Google Calendar ID)"
 }
 ```
 
@@ -115,6 +99,8 @@ The cron scheduler initiates background runs of the agent.
 
 ## 6. Proactive Webhook Gateway (Home Assistant Integration Specs)
 Noga exposes REST endpoints on port `3000` to allow Home Assistant to broadcast notifications, schedule reminders, and query WhatsApp connection status.
+
+Because each tenant operates independently, **webhooks are routed contextually based on the `x-webhook-secret` header**. When a request hits `/api/notify` or `/api/webhook/reminder`, Noga checks the secret header against the database tenant profiles, resolves which tenant owns that secret, and posts the notification to the correct WhatsApp group mapped to that tenant.
 
 ---
 
