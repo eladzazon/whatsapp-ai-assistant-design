@@ -9,6 +9,12 @@ Additionally, Noga exposes a webhook gateway on port `3000` that handles proacti
 
 To keep the deployment stack simple and consolidated, **Home Assistant communication is handled directly inside the core Orchestrator**. The orchestrator includes built-in clients to interact with HASS either via its standard REST API or by initiating direct Model Context Protocol (MCP) client connections, eliminating the need for separate connector images in the Docker stack.
 
+### Core Design Principle: Decoupled Behavior Engine (No Hardcoded Logic)
+To maintain a clean, extensible, and modular codebase, **all custom agent behaviors, sequence rules, confirmation logic, and business workflows must be written in Markdown (`.md`) files inside the skills directory, rather than hardcoded in the application code.** 
+* **The Orchestrator Code** acts purely as a generic ReAct runtime and event router. It exposes primitive tools (file access, HTTP request dispatchers, DB logs, and scheduler hooks) and listens to events (incoming WhatsApp texts, reactions, cron triggers, webhooks).
+* **The Skills Files (`/skills/{tenant_id}/*.md`)** describe the step-by-step execution rules, trigger hooks, validation checks, and prompts.
+* **Dynamic Injection:** When an event occurs, the orchestrator loads the tenant's `identity.md` and the relevant skill markdown instructions, injecting them directly into the LLM system context. Gemini then interprets the markdown instructions on the fly, deciding which low-level primitive tools to execute.
+
 ---
 
 ## 2. High-Level Architecture
@@ -28,22 +34,23 @@ The system supports a **Multi-Tenant Identity Architecture** configured as follo
 ### 3.1 WhatsApp Connector Container (`whatsapp-connector`)
 * **Role:** Establishes the single core WhatsApp Web connection using Baileys.
 * **Responsibilities:**
-  * Detects when the bot account joins a new group (using Baileys events like `chats.upsert` or `groups.update`).
+  * Detects when the bot account joins a new group.
   * Dispatches a registration hook to the Orchestrator with the new group JID and metadata.
-  * Listens to incoming message reactions (e.g., `messages.reaction` event) and forwards them to the Orchestrator along with the sender, the reaction emoji, and the original message ID.
+  * Listens to incoming message reactions (e.g., `messages.reaction` event) and forwards them to the Orchestrator.
 
 ### 3.2 Web Admin Portal / Gateway Container (`admin-portal`)
-* **Role:** Centralized configuration panel and entry API endpoint. Mapped to external host port `3000`.
+* **Role:** Centralized configuration panel.
 
 ### 3.3 Noga Core Orchestrator Container (`ai-orchestrator`)
 * **Role:** The **Autonomous Agent Engine**, Webhook Server, and Home Assistant Driver.
 * **Responsibilities:**
-  * **Tenant Context Router:** Scopes variables, HASS configurations, and tool lists per tenant chat. If a message comes from a disabled/unapproved group chat, it is instantly discarded.
-  * **Reaction Handler Router:** Receives reaction events $\rightarrow$ Resolves target tenant $\rightarrow$ Spawns the autonomous ReAct loop using the instructions written in the tenant's `/skills/{tenant_id}/reminders.md` file.
-  * **Proactive Webhook API Router:** Exposes endpoints to receive HASS notifications and status queries. Authenticates requests using the tenant-specific `x-webhook-secret` header.
-  * **Integrated Home Assistant Drivers:** REST API and MCP.
+  * **Generic ReAct Engine:** Runs a strict Thought $\rightarrow$ Action $\rightarrow$ Observation loop. It compiles the system instructions by loading `/knowledge/{tenant_id}/identity.md` and appending active skill files from `/skills/{tenant_id}/*.md`.
+  * **Tenant Context Router:** Scopes variables, HASS configurations, and tool lists per tenant chat.
+  * **Event Dispatcher:** Map inputs (WhatsApp message, Webhook call, emoji reaction, cron triggers) to the runtime context.
+  * **Tool Primitive Broker:** Exposes simple, parameter-validated CRUD and connection primitives (listed in Section 7) to the agent loop, avoiding any hardcoded business logic.
+  * **Proactive Webhook API Router:** Exposes endpoints to receive HASS notifications and status queries.
   * **Token Logger Middleware:** Records usage metadata from Gemini.
-  * **Background Job & Scheduler Daemon:** Manages dynamic cron execution and schedules proactive message nudges.
+  * **Background Job & Scheduler Daemon:** Manages dynamic cron execution.
 
 ---
 
@@ -65,24 +72,7 @@ Identities are loaded dynamically from `/knowledge/{tenant_id}/identity.md`.
 ```
 
 ### 4.3 Database Schemas (Multi-Tenant Updates)
-
-#### Tenant Profile Schema (`tenants` table)
-```json
-{
-  "tenant_id": "string (Primary Key)",
-  "name": "string (e.g., 'Levi Home')",
-  "enabled": "boolean",
-  "reply_method": "ALL_MESSAGES | TAGGED | KEYWORD",
-  "trigger_keywords": ["string"],
-  "active_model": "string",
-  "language": "string (he | en)",
-  "enabled_tools": ["string"],
-  "webhook_secret": "string (Tenant-specific x-webhook-secret check)",
-  "hass_url": "string (Tenant-specific HASS base URL)",
-  "hass_token": "string (Tenant-specific HASS long-lived token)",
-  "google_calendar_id": "string (Tenant-specific Google Calendar ID)"
-}
-```
+Profiles, chats, whitelists, and log structures.
 
 ---
 
@@ -94,22 +84,42 @@ The cron scheduler initiates background runs of the agent.
 ## 6. Proactive Webhook Gateway (Home Assistant Integration Specs)
 Noga exposes REST endpoints on port `3000` to allow Home Assistant to broadcast notifications, schedule reminders, and query WhatsApp connection status.
 
-Because each tenant operates independently, **webhooks are routed contextually based on the `x-webhook-secret` header**. When a request hits `/api/notify` or `/api/webhook/reminder`, Noga checks the secret header against the database tenant profiles, resolves which tenant owns that secret, and posts the notification to the correct WhatsApp group mapped to that tenant.
-
 ---
 
 ## 7. Modular Core Skills Catalog
 Core capabilities are packaged as separate, loadable modules. Rather than hardcoding behavioral rules in the codebase, Noga's logic (like handling confirmations or retry schedules) is written entirely inside the skill `.md` files.
 
-### 7.1 Reminders, Reactions & Nudging Skill (`/skills/{tenant_id}/reminders.md`)
+The `ai-orchestrator` process only exposes generic, low-level **Tool Primitives**. The AI agent parses the Markdown skill files at runtime to determine how to leverage these tools.
+
+### 7.1 Generic Tool Primitives (Exposed by Code)
+To support fully customizable behaviors, the orchestrator codebase registers the following primitive API bindings as LLM tools:
+* **File Operations:**
+  * `read_file(path)`
+  * `write_file(path, content)`
+  * `search_files(path, regex)`
+* **Scheduler Operations:**
+  * `create_job(name, cron_expression | timestamp, prompt_payload)`
+  * `cancel_job(job_id)`
+  * `list_jobs()`
+* **Reminder Tracking:**
+  * `get_reminder_by_msg_id(message_id)`
+  * `update_reminder_status(reminder_id, status)`
+  * `log_reminder(message_id, title, metadata)`
+* **Home Assistant Operations:**
+  * `hass_call_service(domain, service, service_data)`
+  * `hass_get_state(entity_id)`
+* **Google Services:**
+  * `calendar_list_events(time_min, time_max)`
+  * `calendar_create_event(summary, start_time, end_time)`
+* **Information Retrieval:**
+  * `http_get_json(url, headers)`
+  * `search_web_api(query)`
+
+---
+
+### 7.2 Reminders, Reactions & Nudging Skill (`/skills/{tenant_id}/reminders.md`)
 * **Objective:** Manage dynamic alerts and allow users to mark reminders as done via chat text replies or WhatsApp **emoji reactions** (e.g., 👍, ❤️, "Like").
-* **Behavior Definition (Non-Hardcoded):** The core code only exposes simple primitive database and scheduling tools. The rules governing emoji detection, completion triggers, check-back delays, and nudge schedules are described in the `/skills/{tenant_id}/reminders.md` Markdown instruction file.
-* **Orchestrator Primitive Tools:**
-  * `get_reminder_by_msg_id(message_id)`: Fetches a reminder record linked to the specific WhatsApp message.
-  * `update_reminder_status(reminder_id, status)`: Marks reminder as `done` or `active`.
-  * `schedule_nudge(reminder_id, minutes, count)`: Registers a delayed execution trigger to run the check-in script after $X$ minutes.
-  * `cancel_nudge(reminder_id)`: Deletes any pending scheduled nudge jobs.
-  * `get_nudge_config()`: Fetches the tenant's configured nudge parameters: $X$ (minutes interval) and $N$ (maximum retry count).
+* **Behavior Definition (Non-Hardcoded):** The rules governing emoji detection, completion triggers, check-back delays, and nudge schedules are described in the `/skills/{tenant_id}/reminders.md` Markdown instruction file.
 
 #### Structure of `/skills/{tenant_id}/reminders.md`
 This file defines the workflow instructions that Gemini executes when processing reminder-related triggers:
@@ -127,7 +137,7 @@ This file defines the instructions for running, confirming, and nudging reminder
   2. If a reminder is found:
      - Check if `reaction_emoji` matches confirmation tokens (e.g., 👍, ❤️, or similar positive reactions).
      - If matched, call `update_reminder_status(reminder_id, "done")`.
-     - Immediately call `cancel_nudge(reminder_id)` to stop recurring notifications.
+     - Immediately call `cancel_job(reminder_id)` to stop recurring notifications.
      - Respond to the group confirming completion (e.g., "תודה! סומן שבוצע" or "Reminder marked as done!").
 
 ## 2. Handling Text Confirmation
@@ -136,37 +146,38 @@ This file defines the instructions for running, confirming, and nudging reminder
   1. If a user replies directly to a reminder message with text like "done", "בוצע", "עשיתי", or "טופל":
      - Resolve the reminder using the parent message ID.
      - Call `update_reminder_status(reminder_id, "done")`.
-     - Call `cancel_nudge(reminder_id)`.
+     - Call `cancel_job(reminder_id)`.
 
 ## 3. Nudging & Retry Schedule
 * **Trigger:** ON_REMINDER_FIRED
 * **Instructions:**
-  1. When a reminder is broadcast, create a record in the database linking the sent `message_id` with the reminder.
-  2. Read nudge configs using `get_nudge_config()` to fetch the interval ($X$ minutes) and max retries ($N$).
-  3. Call `schedule_nudge(reminder_id, X, 1)` to schedule the first check-in.
-
-* **Trigger:** ON_NUDGE_TRIGGERED
-* **Context variables:** `reminder_id`, `current_retry_count`
-* **Instructions:**
-  1. Query the reminder status. If status is "done", exit silently.
-  2. If status is still "active":
-     - Fetch the max retries limit ($N$) from `get_nudge_config()`.
-     - If `current_retry_count` < N:
-       - Resend the reminder text as a nudge to the group (e.g. "Reminder nudge: Dryer has finished! Can someone please empty it?").
-       - Increment `current_retry_count`.
-       - Call `schedule_nudge(reminder_id, X, current_retry_count)` to schedule the next check-in.
-     - If `current_retry_count` >= N:
-       - Send a final notice ("Max retries reached. Reminder ignored.") and stop scheduling checks.
+  1. When a reminder is broadcast, create a record in the database using `log_reminder(message_id, title)` linking the sent `message_id` with the reminder.
+  2. Read nudge configs from `/knowledge/{tenant_id}/nudge_config.json` (or inline parameters) to fetch the interval ($X$ minutes) and max retries ($N$).
+  3. Call `create_job(job_id, X_minutes_offset, prompt_payload_for_nudge)` to schedule the first check-in.
 ```
 
-### 7.2 Shopping List
-Confined to `/knowledge/{tenant_id}/shopping_list.md`.
+---
 
-### 7.3 Web Browsing & Information Retrieval
-General tool, enabled/disabled per tenant profile.
+### 7.3 Shopping List Skill (`/skills/{tenant_id}/shopping.md`)
+* **Objective:** Manage lists using local files.
+* **Instructions:**
+  1. For additions, read `/knowledge/{tenant_id}/shopping_list.md` using `read_file`.
+  2. Append the items in Markdown table/list format.
+  3. Save using `write_file`.
+  4. For queries, fetch and format the file content.
 
-### 7.4 Home Assistant Automation
-REST and MCP drivers handled directly inside the orchestrator container.
+---
+
+### 7.4 Web Search & Information Retrieval Skill (`/skills/{tenant_id}/browsing.md`)
+* **Objective:** Fetch live exchange rates (like USD to NIS) or news.
+* **Instructions:**
+  1. When currency rates are requested, construct a request to `http_get_json` using the currency URL (e.g. exchangerates API) or call `search_web_api`.
+  2. Synthesize a clean explanation to the chat.
+
+---
+
+### 7.5 Home Assistant & Inventory Skills (`/skills/{tenant_id}/home_control.md` & `inventory.md`)
+* Descriptions of how HASS actions and pantry tracking are executed using the generic `hass_call_service` and filesystem primitives.
 
 ---
 
